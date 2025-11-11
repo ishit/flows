@@ -7,57 +7,17 @@ from matplotlib import pyplot as plt
 import flax.linen as nn
 import optax
 from loss import lossfun
+import faiss
 
-@jax.jit
-def _process_chunk(chunk, x, x_norms_sq):
-    '''
-    JIT-compiled function to process a single chunk.
-    Computes closest points in x for each point in chunk.
-    '''
-    # chunk: (chunk_size, D)
-    # Compute squared distances using: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a*b
-    chunk_norms_sq = jnp.sum(chunk ** 2, axis=1, keepdims=True)  # (chunk_size, 1)
-    # Use matrix multiplication for efficiency: chunk @ x.T gives dot products
-    dot_products = chunk @ x.T  # (chunk_size, M)
-    squared_dist = chunk_norms_sq + x_norms_sq[None, :] - 2 * dot_products  # (chunk_size, M)
-    
-    # Find indices of closest points
-    closest_indices = jnp.argmin(squared_dist, axis=1)  # (chunk_size,)
-    return closest_indices
+res = faiss.StandardGpuResources()
 
-def closest_points(x_perturbed, x, chunk_size=5000):
-    '''
-    For each x_perturbed[i], find the closest point in x.
-    Uses chunking to handle large datasets efficiently.
-    The inner computation is JIT-compiled for speed.
-    
-    Args:
-        x_perturbed: (N, D) array of perturbed points
-        x: (M, D) array of reference points
-        chunk_size: Size of chunks to process (reduces memory usage)
-        
-    Returns:
-        (N, D) array where result[i] is the closest point in x to x_perturbed[i]
-    '''
-    N = x_perturbed.shape[0]
-    
-    # Precompute squared norms of x for efficiency (reused across chunks)
-    x_norms_sq = jnp.sum(x ** 2, axis=1)  # (M,)
-    
-    # Process all chunks sequentially to manage memory
-    # The inner _process_chunk function is JIT-compiled
-    closest_indices_list = []
-    for i in range(0, N, chunk_size):
-        end_idx = min(i + chunk_size, N)
-        chunk = x_perturbed[i:end_idx]
-        chunk_indices = _process_chunk(chunk, x, x_norms_sq)
-        closest_indices_list.append(chunk_indices)
-    
-    # Concatenate all indices
-    closest_indices = jnp.concatenate(closest_indices_list, axis=0)
-    
-    # Return the actual closest points
-    return x[closest_indices]
+def closest_points_faiss(x_perturbed, x):
+    d = x.shape[1]
+    index_flat = faiss.IndexFlatL2(d)
+    gpu_index_flat = faiss.index_cpu_to_gpu(res, 0, index_flat) 
+    gpu_index_flat.add(x)
+    D, I = gpu_index_flat.search(x_perturbed, 1)
+    return x[I.reshape(-1)]
 
 class HalfMoons:
     def __init__(self, batch_size):
@@ -72,11 +32,11 @@ class HalfMoons:
         x, y = make_moons(n_samples=self.n_samples, random_state=42)
         x = (x - x.mean(axis=0)) / x.std(axis=0)
         x = x * (0.75 / jnp.abs(x).max())
+
         key1, key2 = jax.random.split(self.random_key)
         lambda_ = jax.random.uniform(key1, (self.n_samples, 2), minval=0.0, maxval=1.0)
-
         x_perturbed = lambda_ * x + (1 - lambda_) * jax.random.normal(key2, x.shape)
-        x_closest = closest_points(x_perturbed, x)
+        x_closest = closest_points_faiss(np.array(x_perturbed), np.array(x))
 
         return jnp.array(x_closest), jnp.array(x_perturbed), jnp.array(lambda_)
     
